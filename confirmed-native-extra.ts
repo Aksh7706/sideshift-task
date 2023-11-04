@@ -14,17 +14,16 @@ import { getEthereumNativeDepositUniqueId } from './shared';
 // `context` stores application data, it uses `p-lazy` for efficiency
 import { contextLazy } from './context';
 
-// HACK: Can't find this exported from ethers
-type BlocksWithTransactions = Awaited<
-  ReturnType<ethers.providers.BaseProvider['getBlockWithTransactions']>
->;
-
 const accountTxListResultSchema = z.array(
   z.object({
     hash: z.string(),
     from: z.string(),
     to: z.string(),
     value: z.string(),
+    timeStamp: z.string(),
+    gasPrice: z.string(),
+    gas: z.string(),
+    gasUsed: z.string(),
   })
 );
 
@@ -42,36 +41,37 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
     config: { etherscanApiKey, evmAccount: account },
   } = context;
 
-  const { asset, id: depositMethodId } = nativeMethod;
+  const { asset } = nativeMethod;
 
   const logger = createLogger('ethereum:deposit:confirmed-native');
   const graphQLClient = memGetInternalGqlc();
 
-  async function fetchOrderForAddress(address: string): Promise<Order | undefined> {
-    const order = await db
-      .getRepository(Order)
-      .createQueryBuilder('o')
-      .select()
-      .where(`deposit_method = :depositMethodId`, { depositMethodId })
-      .andWhere(`deposit_address->>'address' = :address`, { address })
-      .getOne();
+  type EtherscanTransaction = z.infer<typeof accountTxListResultSchema>[number]
 
-    return order ?? undefined;
-  }
+  /**
+   * This function processes a transaction and, if it represents a successful deposit, logs the transaction.
+   * 
+   * Modifications have been made to this function to remove redundant fetchOrderForAddress api call 
+   * and to remove unnecessary checks.
+   * 
+   * @param tx The Etherscan transaction to be processed.
+   * @param orderId The associated order id.
+   * @returns {boolean} indicating whether the transaction was successfully logged as a deposit.
+  */
+  const scanTxId = async (tx: EtherscanTransaction, orderId: string) => {
+    // Removing unnecessary checks
+    // assert.equal(typeof tx, 'object', 'tx is not object');
+    // assert(tx.from, 'from missing');
 
-  const scanTxid = async (tx: BlocksWithTransactions['transactions'][0]) => {
-    assert.equal(typeof tx, 'object', 'tx is not object');
-    assert(tx.from, 'from missing');
+    // const { hash: txid, blockHash } = tx;
 
-    const { hash: txid, blockHash } = tx;
+    // if (typeof txid !== 'string') {
+    //   throw new Error(`txid must be string`);
+    // }
 
-    if (typeof txid !== 'string') {
-      throw new Error(`txid must be string`);
-    }
-
-    if (typeof blockHash !== 'string') {
-      throw new Error(`blockHash must be string`);
-    }
+    // if (typeof blockHash !== 'string') {
+    //   throw new Error(`blockHash must be string`);
+    // }
 
     if (!tx.to) {
       // Contract creation
@@ -83,32 +83,31 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
       return false;
     }
 
-    if (!+tx.value) {
-      return false;
-    }
+    // Removing redundant checks. Already performed this before.
+    // if (!+tx.value) {
+    //   return false;
+    // }
 
-    if (tx.gasPrice === undefined) {
+    if (!tx.gasPrice) {
       throw new Error('Unsupported EIP-1559 sweep transaction');
     }
 
-    const total = ns.sum(
-      tx.value.toString(),
-      ns.times(tx.gasLimit.toString(), tx.gasPrice.toString())
-    );
+    const total = ns.sum(tx.value, ns.times(tx.gas, tx.gasPrice));
 
-    const order = await fetchOrderForAddress(tx.from);
+    // Eliminating redundant network calls. Order details have already been fetched previously.
+    // const order = await fetchOrderForAddress(tx.from);
 
-    if (!order) {
-      return false;
-    }
+    // if (!order) {
+    //   return false;
+    // }
 
     const valueAsEther = ethers.utils.formatEther(tx.value);
     const totalAsEther = ethers.utils.formatEther(total);
 
     const wasCredited = await graphQLClient.maybeInternalCreateDeposit({
-      orderId: order.id,
+      orderId: orderId,
       tx: {
-        txid,
+        txid: tx.hash,
       },
       amount: totalAsEther,
       uniqueId: getEthereumNativeDepositUniqueId(nativeMethod, tx.hash),
@@ -118,45 +117,60 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
       return false;
     }
 
-    logger.info(`Stored deposit. ${tx.hash}. ${valueAsEther} ${asset} for order ${order.id}`);
-
+    logger.info(`Stored deposit. ${tx.hash}. ${valueAsEther} ${asset} for order ${orderId}`);
     return true;
   };
 
-  const getEtherScanTxListForAddress = async (address: string) => {
-    const txList = await axios
+  /**
+   * This function gets transactions for a given address from the Etherscan API.
+   * 
+   * Modifications have been made to this function. 
+   * The axios response is now correctly parsed, ensuring proper handling of the API data.
+   * Error handling has also been implemented to address potential Etherscan API errors effectively.
+   * 
+   * @param address 
+   * @returns Promise resolving to an array of Etherscan transactions
+   */
+  const getEtherScanTxListForAddress = async (address: string): Promise<EtherscanTransaction[]> => {
+    const { data } = await axios
       .get(
         `https://api.etherscan.io/api?module=account&action=txlist&address=${address}&sort=desc&apikey=${etherscanApiKey}`
       )
-      .then(res => accountTxListResultSchema.parse(res));
 
-    return txList;
+    if (data.status === '0' && data.result.length > 0) throw Error(`Received error ${data.result} from Etherscan API`)
+    return accountTxListResultSchema.parse(data.result)
   };
 
+  /** 
+  * This function originally contained api calls to retrieve transaction details directly from 
+  * the node and subsequently fetched the block for timestamps, but these calls are unnecessary. 
+  * We're already obtaining transaction details from the Etherscan API, which includes
+  * all necessary information, such as timestamps, making further network calls redundant.
+  * 
+  * By eliminating these redundant API calls, we can significantly improve efficiency.
+  * Hence, code relating to redundant api calls have been commented out.
+  */
   const runScanByOrderId = async () => {
     const queue = await RedisTaskQueue.queues.evmNativeConfirm(network, true);
 
     if (!etherscanApiKey) {
       logger.error('Etherscan not configured');
-
       return;
     }
 
-    await queue.run(async orderId => {
+    await queue.run(async (orderId: string) => {
       logger.info('Processing queued task to look at order %s for deposits', orderId);
 
       const order = await db.getRepository(Order).findOneBy({ id: orderId });
 
       if (!order) {
         logger.error('Order %s not found', orderId);
-
         return;
       }
 
       if (!order.depositAddress) {
         // The deposit address may have been unassigned
         logger.error('Order %s has no deposit address', orderId);
-
         return;
       }
 
@@ -167,7 +181,6 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
         txs = await getEtherScanTxListForAddress(order.depositAddress.address);
       } catch (error: any) {
         logger.error(error, 'Error fetching txs for order %s: %s', orderId, error.message);
-
         return;
       }
 
@@ -179,40 +192,39 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
 
       logger.info('Found %s transactions for order %s', txs.length, orderId);
 
-      await pMap(txs, async etherscanTx => {
-        const ethersTx = await nodeProvider.getTransaction(etherscanTx.hash);
+      await pMap(txs, async (etherscanTx: EtherscanTransaction) => {
+        // const ethersTx = await nodeProvider.getTransaction(etherscanTx.hash);
 
-        if (!ethersTx) {
-          logger.error('Transaction %s not found', etherscanTx.hash);
+        // if (!ethersTx) {
+        //   logger.error('Transaction %s not found', etherscanTx.hash);
 
-          return;
-        }
+        //   return;
+        // }
 
-        if (!ethersTx.blockNumber) {
-          logger.warn('Transaction %s has no block number', etherscanTx.hash);
+        // if (!ethersTx.blockNumber) {
+        //   logger.warn('Transaction %s has no block number', etherscanTx.hash);
 
-          return;
-        }
+        //   return;
+        // }
 
-        const block = await nodeProvider.getBlock(ethersTx.blockNumber);
+        // const block = await nodeProvider.getBlock(ethersTx.blockNumber);
 
-        const timestamp = new Date(block.timestamp * 1000);
+        // const timestamp = new Date(block.timestamp * 1000);
+
+
+        // To convert to milliseconds
+        const timestamp = Number(etherscanTx.timeStamp) * 1000;
 
         // Only transactions that happened after the order was created
         // This should handle deposit address re-assignment
-        if (timestamp.getTime() < order.createdAt.getTime()) {
-          logger.warn(
-            'Ignoring tx %s that happened before order %s was created',
-            etherscanTx.hash,
-            orderId
-          );
-
+        if (timestamp < order.createdAt.getTime()) {
+          logger.warn('Ignoring tx %s that happened before order %s was created', etherscanTx.hash, orderId);
           return;
         }
 
         logger.info('Scanning tx %s', etherscanTx.hash);
-
-        await scanTxid(ethersTx);
+        
+        await scanTxId(etherscanTx, orderId);
       });
     });
   };
